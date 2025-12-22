@@ -2,7 +2,8 @@
 
 #===============================================================================
 # Nordvik Control Installer / Manager
-# Usage: bash <(curl -s https://raw.githubusercontent.com/Wil3on/nordvikctl/main/install.sh)
+# Usage: curl -sO https://raw.githubusercontent.com/Wil3on/nordvikctl/main/install.sh && sudo bash install.sh
+# Or:    curl -s https://raw.githubusercontent.com/Wil3on/nordvikctl/main/install.sh | sudo bash
 #===============================================================================
 
 # Colors
@@ -160,21 +161,30 @@ install_dependencies() {
 # Firewall Management
 #===============================================================================
 
-open_firewall_port() {
-    echo -e "${BLUE}Opening firewall port $WEB_PORT...${NC}"
-    log "Opening firewall port $WEB_PORT"
+open_firewall_ports() {
+    local ports="$@"
+    echo -e "${BLUE}Opening firewall ports: ${ports}...${NC}"
+    log "Opening firewall ports: ${ports}"
 
+    for port in $ports; do
+        if command -v ufw &> /dev/null; then
+            ufw allow $port/tcp 2>/dev/null || true
+        elif command -v firewall-cmd &> /dev/null; then
+            firewall-cmd --permanent --add-port=$port/tcp 2>/dev/null || true
+        elif command -v iptables &> /dev/null; then
+            iptables -A INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null || true
+        fi
+    done
+
+    # Reload firewall if needed
     if command -v ufw &> /dev/null; then
-        ufw allow $WEB_PORT/tcp 2>/dev/null || true
-        echo -e "${GREEN}✅ Port $WEB_PORT opened (ufw)${NC}"
+        echo -e "${GREEN}✅ Ports opened (ufw)${NC}"
     elif command -v firewall-cmd &> /dev/null; then
-        firewall-cmd --permanent --add-port=$WEB_PORT/tcp 2>/dev/null || true
         firewall-cmd --reload 2>/dev/null || true
-        echo -e "${GREEN}✅ Port $WEB_PORT opened (firewalld)${NC}"
+        echo -e "${GREEN}✅ Ports opened (firewalld)${NC}"
     elif command -v iptables &> /dev/null; then
-        iptables -A INPUT -p tcp --dport $WEB_PORT -j ACCEPT 2>/dev/null || true
         iptables-save > /etc/iptables.rules 2>/dev/null || true
-        echo -e "${GREEN}✅ Port $WEB_PORT opened (iptables)${NC}"
+        echo -e "${GREEN}✅ Ports opened (iptables)${NC}"
     else
         echo -e "${YELLOW}Warning: No firewall detected.${NC}"
     fi
@@ -267,11 +277,25 @@ do_install() {
         return 1
     fi
 
+    # Ask for port configuration
+    echo -e "${CYAN}Port Configuration:${NC}"
+    echo ""
+    read -p "Panel port [default: 8080]: " PANEL_PORT
+    PANEL_PORT=${PANEL_PORT:-8080}
+    
+    read -p "Daemon port [default: 8081]: " DAEMON_PORT
+    DAEMON_PORT=${DAEMON_PORT:-8081}
+    
+    echo ""
+    echo -e "Panel will run on port: ${YELLOW}$PANEL_PORT${NC}"
+    echo -e "Daemon will run on port: ${YELLOW}$DAEMON_PORT${NC}"
+    echo ""
+
     # Confirmation
     echo -e "${YELLOW}This will install:${NC}"
     echo "  • nordvikctl to $INSTALL_DIR"
     echo "  • SteamCMD dependencies"
-    echo "  • Open firewall port $WEB_PORT"
+    echo "  • Open firewall ports: $WEB_PORT, $PANEL_PORT, $DAEMON_PORT"
     echo "  • Create systemd service (auto-start)"
     echo ""
     read -p "Continue? (Y/N): " -n 1 -r
@@ -334,6 +358,21 @@ do_install() {
     echo -e "${GREEN}✅ Created symlink: /usr/local/bin/norctl${NC}"
     echo ""
 
+    # Save port configuration
+    echo -e "${BLUE}Saving port configuration...${NC}"
+    cat > "$INSTALL_DIR/config/ports.conf" << EOF
+# Nordvik Port Configuration
+PANEL_PORT=$PANEL_PORT
+DAEMON_PORT=$DAEMON_PORT
+WEB_PORT=$WEB_PORT
+EOF
+    echo -e "${GREEN}✅ Port configuration saved${NC}"
+    echo ""
+
+    # Open firewall ports
+    open_firewall_ports $WEB_PORT $PANEL_PORT $DAEMON_PORT
+    echo ""
+
     # Create service
     create_service
     echo ""
@@ -353,11 +392,13 @@ do_install() {
     echo -e "${CYAN}Installed:${NC}"
     echo "  ✅ nordvikctl binary"
     echo "  ✅ SteamCMD dependencies"
-    echo "  ✅ Firewall port $WEB_PORT"
+    echo "  ✅ Firewall ports: $WEB_PORT, $PANEL_PORT, $DAEMON_PORT"
     echo "  ✅ Systemd service (auto-start)"
     echo ""
-    echo -e "${BLUE}Web UI available at:${NC}"
-    echo -e "  ${YELLOW}http://$SERVER_IP:$WEB_PORT${NC}"
+    echo -e "${BLUE}Port Configuration:${NC}"
+    echo -e "  Web UI:    ${YELLOW}http://$SERVER_IP:$WEB_PORT${NC}"
+    echo -e "  Panel:     ${YELLOW}$PANEL_PORT${NC}"
+    echo -e "  Daemon:    ${YELLOW}$DAEMON_PORT${NC}"
     echo ""
     echo -e "${BLUE}Service commands:${NC}"
     echo "  systemctl status $SERVICE_NAME"
