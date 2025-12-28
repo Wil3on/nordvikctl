@@ -18,7 +18,7 @@ NC='\033[0m' # No Color
 # Configuration
 GITHUB_REPO="Wil3on/nordvikctl"
 INSTALL_DIR="/srv/nordvik/nordvikctl"
-BINARY_NAME="norctl"
+BINARY_NAME="nordvikctl"
 SERVICE_NAME="nordvikctl"
 WEB_PORT=31777
 LOG_FILE="/var/log/nordvik-install.log"
@@ -354,8 +354,8 @@ do_install() {
     chmod +x "$INSTALL_DIR/$BINARY_NAME"
 
     # Create symlink
-    ln -sf "$INSTALL_DIR/$BINARY_NAME" /usr/local/bin/norctl
-    echo -e "${GREEN}✅ Created symlink: /usr/local/bin/norctl${NC}"
+    ln -sf "$INSTALL_DIR/$BINARY_NAME" /usr/local/bin/nordvikctl
+    echo -e "${GREEN}✅ Created symlink: /usr/local/bin/nordvikctl${NC}"
     echo ""
 
     # Save port configuration
@@ -537,7 +537,7 @@ do_uninstall() {
     echo ""
 
     # Remove symlink
-    rm -f /usr/local/bin/norctl
+    rm -f /usr/local/bin/nordvikctl
     echo -e "${GREEN}✅ Symlink removed${NC}"
 
     # Remove install directory
