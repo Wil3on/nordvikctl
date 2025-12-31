@@ -6,6 +6,8 @@
 # Or:    curl -s https://raw.githubusercontent.com/Wil3on/nordvikctl/main/install.sh | sudo bash
 #===============================================================================
 
+set -euo pipefail
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -20,12 +22,24 @@ GITHUB_REPO="Wil3on/nordvikctl"
 INSTALL_DIR="/srv/nordvik/nordvikctl"
 BINARY_NAME="nordvikctl"
 SERVICE_NAME="nordvikctl"
+SERVICE_USER="nordvik"
 WEB_PORT=31777
 LOG_FILE="/var/log/nordvik-install.log"
+TEMP_DIR=""
 
 #===============================================================================
 # Helper Functions
 #===============================================================================
+
+# Cleanup function for traps
+cleanup() {
+    if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
+        rm -rf "$TEMP_DIR"
+    fi
+}
+
+# Set trap for cleanup on exit/interrupt
+trap cleanup EXIT INT TERM
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
@@ -46,6 +60,47 @@ check_root() {
         echo "Usage: sudo bash <(curl -s URL)"
         exit 1
     fi
+}
+
+check_dependencies() {
+    local missing=()
+    
+    if ! command -v curl &> /dev/null; then
+        missing+=("curl")
+    fi
+    
+    if ! command -v tar &> /dev/null; then
+        missing+=("tar")
+    fi
+    
+    if ! command -v systemctl &> /dev/null; then
+        echo -e "${RED}Error: systemd is required but not found.${NC}"
+        exit 1
+    fi
+    
+    if [ ${#missing[@]} -gt 0 ]; then
+        echo -e "${RED}Error: Missing required dependencies: ${missing[*]}${NC}"
+        echo "Please install them first."
+        exit 1
+    fi
+}
+
+check_network() {
+    echo -e "${BLUE}Checking network connectivity...${NC}"
+    if ! curl -s --max-time 10 -o /dev/null https://api.github.com; then
+        echo -e "${RED}Error: Cannot reach GitHub. Please check your internet connection.${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}✅ Network OK${NC}"
+    return 0
+}
+
+validate_port() {
+    local port="$1"
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        return 1
+    fi
+    return 0
 }
 
 detect_os() {
@@ -91,7 +146,7 @@ get_server_ip() {
 
 get_installed_version() {
     if [ -f "$INSTALL_DIR/$BINARY_NAME" ]; then
-        INSTALLED_VERSION=$("$INSTALL_DIR/$BINARY_NAME" --version 2>/dev/null | grep -oP 'v?\d+\.\d+\.\d+' | head -1)
+        INSTALLED_VERSION=$("$INSTALL_DIR/$BINARY_NAME" --version 2>/dev/null | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         if [ -z "$INSTALLED_VERSION" ]; then
             INSTALLED_VERSION="unknown"
         fi
@@ -100,18 +155,26 @@ get_installed_version() {
     fi
 }
 
+# Compare semantic versions (returns 0 if v1 >= v2)
+version_gte() {
+    local v1="${1#v}"
+    local v2="${2#v}"
+    printf '%s\n%s\n' "$v2" "$v1" | sort -V -C
+}
+
 get_latest_version() {
     RELEASE_URL="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
-    RELEASE_INFO=$(curl -s "$RELEASE_URL")
+    RELEASE_INFO=$(curl -s --max-time 15 "$RELEASE_URL")
     
-    if echo "$RELEASE_INFO" | grep -q "Not Found"; then
+    if echo "$RELEASE_INFO" | grep -q "Not Found\|rate limit"; then
         LATEST_VERSION=""
         DOWNLOAD_URL=""
         return 1
     fi
 
-    LATEST_VERSION=$(echo "$RELEASE_INFO" | grep -oP '"tag_name":\s*"\K[^"]+' | head -1)
-    DOWNLOAD_URL=$(echo "$RELEASE_INFO" | grep -oP '"browser_download_url":\s*"\K[^"]+linux[^"]+\.tar\.gz' | head -1)
+    # Use grep -E for better compatibility (POSIX extended regex)
+    LATEST_VERSION=$(echo "$RELEASE_INFO" | grep -oE '"tag_name":\s*"[^"]+"' | head -1 | sed 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/')
+    DOWNLOAD_URL=$(echo "$RELEASE_INFO" | grep -oE '"browser_download_url":\s*"[^"]+linux[^"]+\.tar\.gz"' | head -1 | sed 's/.*"browser_download_url":[[:space:]]*"\([^"]*\)".*/\1/')
 }
 
 check_disk_space() {
@@ -191,19 +254,27 @@ open_firewall_ports() {
 }
 
 close_firewall_port() {
-    echo -e "${BLUE}Closing firewall port $WEB_PORT...${NC}"
-    log "Closing firewall port $WEB_PORT"
+    local ports="${1:-$WEB_PORT}"
+    echo -e "${BLUE}Closing firewall ports: ${ports}...${NC}"
+    log "Closing firewall ports: ${ports}"
+
+    for port in $ports; do
+        if command -v ufw &> /dev/null; then
+            ufw delete allow $port/tcp 2>/dev/null || true
+        elif command -v firewall-cmd &> /dev/null; then
+            firewall-cmd --permanent --remove-port=$port/tcp 2>/dev/null || true
+        elif command -v iptables &> /dev/null; then
+            iptables -D INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null || true
+        fi
+    done
 
     if command -v ufw &> /dev/null; then
-        ufw delete allow $WEB_PORT/tcp 2>/dev/null || true
-        echo -e "${GREEN}✅ Port $WEB_PORT closed (ufw)${NC}"
+        echo -e "${GREEN}✅ Ports closed (ufw)${NC}"
     elif command -v firewall-cmd &> /dev/null; then
-        firewall-cmd --permanent --remove-port=$WEB_PORT/tcp 2>/dev/null || true
         firewall-cmd --reload 2>/dev/null || true
-        echo -e "${GREEN}✅ Port $WEB_PORT closed (firewalld)${NC}"
+        echo -e "${GREEN}✅ Ports closed (firewalld)${NC}"
     elif command -v iptables &> /dev/null; then
-        iptables -D INPUT -p tcp --dport $WEB_PORT -j ACCEPT 2>/dev/null || true
-        echo -e "${GREEN}✅ Port $WEB_PORT closed (iptables)${NC}"
+        echo -e "${GREEN}✅ Ports closed (iptables)${NC}"
     fi
 }
 
@@ -215,10 +286,20 @@ create_service() {
     echo -e "${BLUE}Creating systemd service...${NC}"
     log "Creating systemd service"
 
+    # Create service user if it doesn't exist
+    if ! id "$SERVICE_USER" &>/dev/null; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER" 2>/dev/null || true
+        echo -e "${GREEN}✅ Service user '$SERVICE_USER' created${NC}"
+    fi
+
+    # Set ownership
+    chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR" 2>/dev/null || true
+
     cat > "/etc/systemd/system/$SERVICE_NAME.service" << EOF
 [Unit]
 Description=Nordvik Control Web UI
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -226,7 +307,15 @@ WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/$BINARY_NAME
 Restart=always
 RestartSec=5
-User=root
+User=$SERVICE_USER
+Group=$SERVICE_USER
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=$INSTALL_DIR
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
@@ -235,7 +324,15 @@ EOF
     systemctl daemon-reload
     systemctl enable $SERVICE_NAME 2>/dev/null || true
     systemctl start $SERVICE_NAME 2>/dev/null || true
-    echo -e "${GREEN}✅ Systemd service created and started${NC}"
+    
+    # Verify service started
+    sleep 2
+    if systemctl is-active --quiet $SERVICE_NAME; then
+        echo -e "${GREEN}✅ Systemd service created and started${NC}"
+    else
+        echo -e "${YELLOW}⚠️  Service created but may not have started correctly${NC}"
+        echo "Check: journalctl -u $SERVICE_NAME -n 20"
+    fi
 }
 
 remove_service() {
@@ -246,6 +343,13 @@ remove_service() {
     systemctl disable $SERVICE_NAME 2>/dev/null || true
     rm -f "/etc/systemd/system/$SERVICE_NAME.service"
     systemctl daemon-reload
+    
+    # Remove service user
+    if id "$SERVICE_USER" &>/dev/null; then
+        userdel "$SERVICE_USER" 2>/dev/null || true
+        echo -e "${GREEN}✅ Service user removed${NC}"
+    fi
+    
     echo -e "${GREEN}✅ Systemd service removed${NC}"
 }
 
@@ -258,6 +362,9 @@ do_install() {
     echo -e "${CYAN}=== Installing Nordvik Control ===${NC}"
     echo ""
     log "Starting installation"
+
+    # Check dependencies first
+    check_dependencies
 
     # Check if already installed
     if is_installed; then
@@ -277,14 +384,31 @@ do_install() {
         return 1
     fi
 
-    # Ask for port configuration
+    # Check network
+    if ! check_network; then
+        return 1
+    fi
+
+    # Ask for port configuration with validation
     echo -e "${CYAN}Port Configuration:${NC}"
     echo ""
-    read -p "Panel port [default: 8080]: " PANEL_PORT
-    PANEL_PORT=${PANEL_PORT:-8080}
+    while true; do
+        read -p "Panel port [default: 8080]: " PANEL_PORT
+        PANEL_PORT=${PANEL_PORT:-8080}
+        if validate_port "$PANEL_PORT"; then
+            break
+        fi
+        echo -e "${RED}Invalid port. Please enter a number between 1-65535.${NC}"
+    done
     
-    read -p "Daemon port [default: 8081]: " DAEMON_PORT
-    DAEMON_PORT=${DAEMON_PORT:-8081}
+    while true; do
+        read -p "Daemon port [default: 8081]: " DAEMON_PORT
+        DAEMON_PORT=${DAEMON_PORT:-8081}
+        if validate_port "$DAEMON_PORT"; then
+            break
+        fi
+        echo -e "${RED}Invalid port. Please enter a number between 1-65535.${NC}"
+    done
     
     echo ""
     echo -e "Panel will run on port: ${YELLOW}$PANEL_PORT${NC}"
@@ -324,10 +448,6 @@ do_install() {
     install_dependencies
     echo ""
 
-    # Open firewall
-    open_firewall_port
-    echo ""
-
     # Create directory
     echo -e "${BLUE}Creating install directory...${NC}"
     mkdir -p "$INSTALL_DIR"
@@ -345,10 +465,19 @@ do_install() {
         curl -#L "$DOWNLOAD_URL" -o "$TEMP_FILE"
     fi
 
+    # Verify download
+    if [ ! -f "$TEMP_FILE" ] || [ ! -s "$TEMP_FILE" ]; then
+        echo -e "${RED}Error: Download failed or file is empty.${NC}"
+        return 1
+    fi
+
     # Extract
     echo -e "${BLUE}Extracting...${NC}"
-    tar -xzf "$TEMP_FILE" -C "$INSTALL_DIR"
-    rm -rf "$TEMP_DIR"
+    if ! tar -xzf "$TEMP_FILE" -C "$INSTALL_DIR"; then
+        echo -e "${RED}Error: Failed to extract archive.${NC}"
+        return 1
+    fi
+    # Cleanup handled by trap
 
     # Make executable
     chmod +x "$INSTALL_DIR/$BINARY_NAME"
@@ -436,8 +565,8 @@ do_update() {
     echo -e "Latest version:  ${GREEN}$LATEST_VERSION${NC}"
     echo ""
 
-    # Compare versions
-    if [ "$INSTALLED_VERSION" = "$LATEST_VERSION" ]; then
+    # Compare versions using semantic versioning
+    if [ "$INSTALLED_VERSION" != "unknown" ] && version_gte "$INSTALLED_VERSION" "$LATEST_VERSION"; then
         echo -e "${GREEN}You already have the latest version!${NC}"
         return 0
     fi
@@ -532,8 +661,13 @@ do_uninstall() {
     remove_service
     echo ""
 
-    # Close firewall port
-    close_firewall_port
+    # Load saved port config for firewall cleanup
+    if [ -f "$INSTALL_DIR/config/ports.conf" ]; then
+        source "$INSTALL_DIR/config/ports.conf" 2>/dev/null || true
+    fi
+
+    # Close all firewall ports
+    close_firewall_port "$WEB_PORT $PANEL_PORT $DAEMON_PORT"
     echo ""
 
     # Remove symlink
@@ -607,45 +741,46 @@ do_version_check() {
 #===============================================================================
 
 show_menu() {
-    print_header
-    
-    detect_os
-    detect_package_manager
+    while true; do
+        print_header
+        
+        detect_os
+        detect_package_manager
 
-    echo -e "${CYAN}System: Linux $ARCH | Package Manager: $PKG_MANAGER${NC}"
-    echo ""
+        echo -e "${CYAN}System: Linux $ARCH | Package Manager: $PKG_MANAGER${NC}"
+        echo ""
 
-    # Quick status
-    get_installed_version
-    if [ -n "$INSTALLED_VERSION" ]; then
-        echo -e "Status: ${GREEN}Installed${NC} (v$INSTALLED_VERSION)"
-    else
-        echo -e "Status: ${YELLOW}Not installed${NC}"
-    fi
-    echo ""
+        # Quick status
+        get_installed_version
+        if [ -n "$INSTALLED_VERSION" ]; then
+            echo -e "Status: ${GREEN}Installed${NC} (v$INSTALLED_VERSION)"
+        else
+            echo -e "Status: ${YELLOW}Not installed${NC}"
+        fi
+        echo ""
 
-    echo -e "${YELLOW}Select an option:${NC}"
-    echo ""
-    echo -e "  ${GREEN}1)${NC} Install Nordvikctl"
-    echo -e "  ${BLUE}2)${NC} Update Nordvikctl"
-    echo -e "  ${RED}3)${NC} Uninstall Nordvikctl"
-    echo -e "  ${CYAN}4)${NC} Check Version"
-    echo -e "  ${MAGENTA}0)${NC} Exit"
-    echo ""
-    read -p "Enter option [0-4]: " choice
+        echo -e "${YELLOW}Select an option:${NC}"
+        echo ""
+        echo -e "  ${GREEN}1)${NC} Install Nordvikctl"
+        echo -e "  ${BLUE}2)${NC} Update Nordvikctl"
+        echo -e "  ${RED}3)${NC} Uninstall Nordvikctl"
+        echo -e "  ${CYAN}4)${NC} Check Version"
+        echo -e "  ${MAGENTA}0)${NC} Exit"
+        echo ""
+        read -p "Enter option [0-4]: " choice
 
-    case $choice in
-        1) do_install ;;
-        2) do_update ;;
-        3) do_uninstall ;;
-        4) do_version_check ;;
-        0) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
-        *) echo -e "${RED}Invalid option${NC}" ;;
-    esac
+        case $choice in
+            1) do_install ;;
+            2) do_update ;;
+            3) do_uninstall ;;
+            4) do_version_check ;;
+            0) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
+            *) echo -e "${RED}Invalid option${NC}" ;;
+        esac
 
-    echo ""
-    read -p "Press Enter to continue..."
-    show_menu
+        echo ""
+        read -p "Press Enter to continue..."
+    done
 }
 
 #===============================================================================
@@ -653,6 +788,7 @@ show_menu() {
 #===============================================================================
 
 check_root
+check_dependencies
 mkdir -p "$(dirname "$LOG_FILE")"
 log "=== Nordvik Control Manager started ==="
 show_menu
